@@ -1,0 +1,22 @@
+{
+  "manifest_version": 3,
+  "name": "YouTube 中文助手",
+  "version": "2.7",
+  "description": "自动翻译 YouTube 视频字幕为中文并朗读",
+  "permissions": ["storage"],
+  "host_permissions": [
+    "https://www.youtube.com/*",
+    "https://api.mymemory.translated.net/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": ["https://www.youtube.com/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "YouTube 中文助手"
+  }
+}
