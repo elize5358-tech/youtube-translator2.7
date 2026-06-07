@@ -1,4 +1,4 @@
-项目简介：YouTube 翻译助手。
+项目简介：YouTube 语音翻译助手。
 核心功能：实时翻译、TTS 语音等。
 技术栈：Codex, JavaScript, Chrome Extension API。
 如何安装：
