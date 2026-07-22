@@ -11,7 +11,13 @@
   "content_scripts": [
     {
       "matches": ["https://www.youtube.com/*"],
-      "js": ["content.js"],
+      "js": [
+        "src/core/language.js",
+        "src/core/cues.js",
+        "src/translation/mymemory.js",
+        "src/translation/index.js",
+        "content.js"
+      ],
       "run_at": "document_idle"
     }
   ],
