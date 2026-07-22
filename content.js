@@ -7,7 +7,7 @@
     translateEnabled: true,
     ttsEnabled: true,
     speechRate: 1.0,
-    targetLang: "zh",
+    targetLang: "zh-CN",
   };
   let settings = { ...defaults };
 
@@ -276,13 +276,14 @@
   }
 
   function selectBestTrack(tracks) {
-    // Prefer English, then auto-generated English
+    const language = (track) =>
+      YTChineseHelper.normalizeLanguageCode(track.languageCode);
+    const supported = (track) => ["ko", "en", "ja"].includes(language(track));
     const priority = [
-      (t) => t.languageCode === "en" && !t.kind,
-      (t) => t.languageCode === "en" && t.kind === "asr",
-      (t) => t.languageCode.startsWith("en"),
-      (t) => !t.kind, // any manual caption
-      (t) => true, // any
+      (t) => supported(t) && !t.kind,
+      (t) => supported(t) && t.kind === "asr",
+      (t) => !t.kind,
+      (t) => true,
     ];
     for (const match of priority) {
       const found = tracks.find(match);
@@ -448,40 +449,34 @@
   }
 
   // ── Translation ──
-  const translationCache = new Map();
-
-  async function translate(text) {
-    if (translationCache.has(text)) return translationCache.get(text);
-    if (!text.trim()) return text;
-
-    try {
-      const langPair = `en|${settings.targetLang}`;
-      const res = await fetch(
-        `https://api.mymemory.translated.net/get?q=${encodeURIComponent(text)}&langpair=${langPair}`
-      );
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const data = await res.json();
-      const translated =
-        data.responseData?.translatedText || text;
-      translationCache.set(text, translated);
-      return translated;
-    } catch (e) {
-      console.error("翻译失败", e);
-      return text;
-    }
+  async function translate(text, sourceLanguage) {
+    const result = await YTChineseHelper.translateText({
+      text,
+      sourceLanguage,
+      targetLanguage: settings.targetLang,
+    });
+    return result;
   }
 
-  async function translateBatch(cues) {
+  async function translateBatch(cues, sourceLanguage) {
     const results = [];
-    for (const cue of cues) {
-      if (translationCache.has(cue.text)) {
-        results.push({ ...cue, translated: translationCache.get(cue.text) });
-        continue;
+    const batchSize = 3;
+    for (let index = 0; index < cues.length; index += batchSize) {
+      const batch = cues.slice(index, index + batchSize);
+      const translatedBatch = await Promise.all(
+        batch.map(async (cue) => {
+          const result = await translate(cue.text, sourceLanguage);
+          return {
+            ...cue,
+            translated: result.text,
+            translationStatus: result.status,
+          };
+        })
+      );
+      results.push(...translatedBatch);
+      if (index + batchSize < cues.length) {
+        await new Promise((resolve) => setTimeout(resolve, 100));
       }
-      const translated = await translate(cue.text);
-      results.push({ ...cue, translated });
-      // Small delay to avoid rate limiting
-      await new Promise((r) => setTimeout(r, 200));
     }
     return results;
   }
@@ -521,28 +516,48 @@
   speechSynthesis.onvoiceschanged = loadVoices;
   loadVoices();
 
-  function speak(text) {
-    if (!settings.ttsEnabled) return;
-    if (!text) return;
+  function prepareSpeechText(text) {
+    return String(text || "")
+      .replace(/\.\.\.+/g, "……")
+      .replace(/\s*([，。！？；：])\s*/g, "$1")
+      .replace(/([。！？])\1+/g, "$1")
+      .replace(/\s+/g, " ")
+      .trim()
+      .replace(/([^。！？…])$/, "$1。");
+  }
 
-    speakQueue = [];
-    speechSynthesis.cancel();
+  function processSpeakQueue() {
+    if (isSpeaking || speakQueue.length === 0) return;
+
+    const text = speakQueue.shift();
+    const token = speakToken;
     isSpeaking = true;
-    const token = ++speakToken;
 
     const utterance = new SpeechSynthesisUtterance(text);
     utterance.lang = "zh-CN";
     utterance.rate = settings.speechRate;
+    utterance.pitch = 1;
     if (bestVoice) utterance.voice = bestVoice;
 
-    utterance.onend = () => {
-      if (token === speakToken) isSpeaking = false;
+    const finish = () => {
+      if (token !== speakToken) return;
+      isSpeaking = false;
+      processSpeakQueue();
     };
-    utterance.onerror = () => {
-      if (token === speakToken) isSpeaking = false;
-    };
+    utterance.onend = finish;
+    utterance.onerror = finish;
 
     speechSynthesis.speak(utterance);
+  }
+
+  function speak(text) {
+    if (!settings.ttsEnabled) return;
+    const preparedText = prepareSpeechText(text);
+    if (!preparedText) return;
+
+    // Keep the current sentence intact and retain only the newest pending cue.
+    speakQueue = [preparedText];
+    processSpeakQueue();
   }
 
   // ── Main loop ──
@@ -557,6 +572,7 @@
   let lastLiveTranslatedText = "";
   let lastLiveSpokenText = "";
   let liveTranslateInFlight = false;
+  let activeSourceLanguage = "unknown";
 
   function getCurrentTimeMs() {
     const video = document.querySelector("video");
@@ -585,7 +601,10 @@
     captionCues = [];
     translatedCues = [];
     lastSpokenIndex = -1;
-    translationCache.clear();
+    if (typeof YTChineseHelper.clearTranslationCache !== "function") {
+      throw new Error("Translation adapter is not loaded");
+    }
+    YTChineseHelper.clearTranslationCache();
     speakQueue = [];
     speechSynthesis.cancel();
     isSpeaking = false;
@@ -611,6 +630,7 @@
     }
 
     const bestTrack = selectBestTrack(tracks);
+    activeSourceLanguage = YTChineseHelper.normalizeLanguageCode(bestTrack.languageCode);
     console.log("[YouTube中文助手] 使用字幕轨道:", bestTrack.languageCode, bestTrack.kind || "manual");
 
     const rankedTracks = rankCaptionTracks(tracks);
@@ -620,6 +640,7 @@
       youtubeTranslatedCues = await fetchCaptions(track, { translate: true });
       if (youtubeTranslatedCues.length > 0) {
         sourceTrack = track;
+        activeSourceLanguage = YTChineseHelper.normalizeLanguageCode(sourceTrack.languageCode);
         break;
       }
     }
@@ -627,6 +648,7 @@
       translatedCues = youtubeTranslatedCues.map((cue) => ({
         ...cue,
         translated: cue.text,
+        translationStatus: "translated",
       }));
       captionCues = youtubeTranslatedCues;
       isInitialized = true;
@@ -639,6 +661,7 @@
       captionCues = await fetchCaptions(track);
       if (captionCues.length > 0) {
         sourceTrack = track;
+        activeSourceLanguage = YTChineseHelper.normalizeLanguageCode(sourceTrack.languageCode);
         console.log(
           "[YouTube中文助手] 使用可下载字幕轨道:",
           sourceTrack.languageCode,
@@ -657,7 +680,7 @@
     }
 
     showOverlay("正在翻译字幕...");
-    translatedCues = await translateBatch(captionCues);
+    translatedCues = await translateBatch(captionCues, sourceTrack.languageCode);
     isInitialized = true;
     showOverlay("翻译完成，开始播放");
   }
@@ -721,13 +744,17 @@
 
     liveTranslateInFlight = true;
     try {
-      const translated = await translate(text);
+      const result = await translate(text, activeSourceLanguage);
       if (text === lastLiveCaptionText) {
-        lastLiveTranslatedText = translated;
-        showOverlay(translated);
-        if (settings.ttsEnabled && text !== lastLiveSpokenText) {
+        lastLiveTranslatedText = result.text;
+        showOverlay(result.text);
+        if (
+          settings.ttsEnabled &&
+          result.status === "translated" &&
+          text !== lastLiveSpokenText
+        ) {
           lastLiveSpokenText = text;
-          speak(translated);
+          speak(result.text);
         }
       }
     } finally {
@@ -771,7 +798,7 @@
       // Speak if new cue and TTS is enabled
       if (cueIndex !== lastSpokenIndex) {
         lastSpokenIndex = cueIndex;
-        if (settings.ttsEnabled) {
+        if (settings.ttsEnabled && cue.translationStatus === "translated") {
           speak(cue.translated);
         }
       }
