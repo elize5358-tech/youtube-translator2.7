@@ -57,15 +57,24 @@
       });
     }
 
-    const result = await global.YTChineseHelper.translateWithMyMemory({
+    let provider = "chrome";
+    let result = await global.YTChineseHelper.translateWithChrome({
       text: originalText,
       sourceLanguage: source,
       targetLanguage: target,
     });
+    if (result.status === "unavailable") {
+      provider = "mymemory";
+      result = await global.YTChineseHelper.translateWithMyMemory({
+        text: originalText,
+        sourceLanguage: source,
+        targetLanguage: target,
+      });
+    }
     const normalized = createResult({
       text: result.status === "translated" ? result.text : originalText,
       status: result.status === "translated" ? "translated" : "fallback-original",
-      provider: "mymemory",
+      provider,
       sourceLanguage: source,
       targetLanguage: target,
       error: result.status === "translated" ? null : result.error,
@@ -76,6 +85,7 @@
 
   function clearTranslationCache() {
     cache.clear();
+    global.YTChineseHelper.clearChromeTranslators?.();
   }
 
   global.YTChineseHelper = global.YTChineseHelper || {};

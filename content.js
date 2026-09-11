@@ -24,6 +24,13 @@
     for (const [key, { newValue }] of Object.entries(changes)) {
       if (key in settings) settings[key] = newValue;
     }
+    if (!settings.ttsEnabled || !settings.translateEnabled) {
+      speakToken++;
+      speechSynthesis.cancel();
+      speakQueue = [];
+      isSpeaking = false;
+      releaseVideo();
+    }
   });
 
   // ── Subtitle overlay ──
@@ -344,7 +351,59 @@
     return cues;
   }
 
+  function fetchCaptionResource(url) {
+    const parsedUrl = new URL(url);
+    if (parsedUrl.hostname === window.location.hostname) {
+      return fetch(url, {
+        credentials: "include",
+        cache: "no-store",
+      })
+        .then(async (response) => ({
+          ok: response.ok,
+          status: response.status,
+          body: await response.text(),
+        }))
+        .catch((error) => ({
+          ok: false,
+          status: 0,
+          body: "",
+          error: error instanceof Error ? error.message : String(error),
+        }));
+    }
+
+    return new Promise((resolve) => {
+      chrome.runtime.sendMessage(
+        { type: "FETCH_YOUTUBE_CAPTIONS", url },
+        (response) => {
+          const runtimeError = chrome.runtime.lastError;
+          if (runtimeError) {
+            resolve({ ok: false, status: 0, body: "", error: runtimeError.message });
+            return;
+          }
+          resolve(response || { ok: false, status: 0, body: "", error: "No response" });
+        }
+      );
+    });
+  }
+
+  function logCaptionResponse(format, translated, response) {
+    const status = response.status || 0;
+    const bytes = response.body?.length || 0;
+    const outcome = response.ok && bytes > 0 ? "成功" : "失败";
+    console.info(
+      `[YouTube中文助手] 字幕请求${outcome}`,
+      `format=${format}`,
+      `translated=${translated}`,
+      `status=${status}`,
+      `bytes=${bytes}`,
+      response.error ? `error=${response.error}` : ""
+    );
+  }
+
+  let captionRequestsRateLimited = false;
+
   async function fetchCaptions(track, options = {}) {
+    if (captionRequestsRateLimited) return [];
     const captionParams = { fmt: "json3" };
     if (options.translate) {
       captionParams.tlang = normalizeYouTubeTargetLang(settings.targetLang);
@@ -353,9 +412,11 @@
     // Try json3 format first (most reliable structured format)
     try {
       const url = buildCaptionUrl(track, captionParams);
-      const res = await fetch(url);
+      const res = await fetchCaptionResource(url);
+      logCaptionResponse("json3", Boolean(options.translate), res);
+      if (res.status === 429) captionRequestsRateLimited = true;
       if (res.ok) {
-        const text = (await res.text()).trim();
+        const text = res.body.trim();
         if (text.startsWith("{") || text.startsWith("[")) {
           const data = JSON.parse(text);
           const cues = parseJson3Captions(data);
@@ -386,9 +447,10 @@
     if (options.translate) return [];
 
     try {
-      const res = await fetch(buildCaptionUrl(track, { fmt: "srv3" }));
+      const res = await fetchCaptionResource(buildCaptionUrl(track, { fmt: "srv3" }));
+      logCaptionResponse("srv3", false, res);
       if (res.ok) {
-        const xml = await res.text();
+        const xml = res.body;
         if (xml.includes("<text")) {
           const cues = parseXmlCaptions(xml);
           if (cues.length > 0) {
@@ -410,9 +472,10 @@
 
     // Last resort: default response (usually srv1 XML)
     try {
-      const res = await fetch(buildCaptionUrl(track));
+      const res = await fetchCaptionResource(buildCaptionUrl(track));
+      logCaptionResponse("default", false, res);
       if (res.ok) {
-        const xml = await res.text();
+        const xml = res.body;
         const cues = parseXmlCaptions(xml);
         if (cues.length > 0) {
           console.log("[YouTube中文助手] 默认格式获取成功:", cues.length, "条");
@@ -486,6 +549,13 @@
   let isSpeaking = false;
   let bestVoice = null;
   let speakToken = 0;
+  let heldVideo = null;
+
+  function releaseVideo() {
+    const video = heldVideo;
+    heldVideo = null;
+    if (video && video.paused && !video.ended) video.play().catch(() => {});
+  }
 
   function loadVoices() {
     const voices = speechSynthesis.getVoices();
@@ -527,7 +597,11 @@
   }
 
   function processSpeakQueue() {
-    if (isSpeaking || speakQueue.length === 0) return;
+    if (isSpeaking) return;
+    if (speakQueue.length === 0) {
+      releaseVideo();
+      return;
+    }
 
     const text = speakQueue.shift();
     const token = speakToken;
@@ -555,8 +629,12 @@
     const preparedText = prepareSpeechText(text);
     if (!preparedText) return;
 
-    // Keep the current sentence intact and retain only the newest pending cue.
-    speakQueue = [preparedText];
+    speakQueue.push(preparedText);
+    const video = document.querySelector("video");
+    if (video && !video.paused && !heldVideo) {
+      heldVideo = video;
+      video.pause();
+    }
     processSpeakQueue();
   }
 
@@ -569,10 +647,22 @@
   let isInitialized = false;
   let liveCaptionMode = false;
   let lastLiveCaptionText = "";
+  let lastLiveTranslatedSourceText = "";
   let lastLiveTranslatedText = "";
   let lastLiveSpokenText = "";
   let liveTranslateInFlight = false;
+  let lastLiveTranslationStartedAt = 0;
+  let liveTranslationRetryAt = 0;
   let activeSourceLanguage = "unknown";
+  let liveSnapshot = "";
+  let liveSnapshotAt = 0;
+  let livePendingSince = 0;
+  let liveConsumed = "";
+  let liveGeneration = 0;
+  const LIVE_TRANSLATION_INTERVAL_MS = 1200;
+  const LIVE_TRANSLATION_BACKOFF_MS = 10000;
+  const LIVE_CAPTION_SETTLE_MS = 900;
+  const LIVE_CAPTION_MAX_WAIT_MS = 1800;
 
   function getCurrentTimeMs() {
     const video = document.querySelector("video");
@@ -595,9 +685,17 @@
     isInitialized = false;
     liveCaptionMode = false;
     lastLiveCaptionText = "";
+    lastLiveTranslatedSourceText = "";
     lastLiveTranslatedText = "";
     lastLiveSpokenText = "";
     liveTranslateInFlight = false;
+    lastLiveTranslationStartedAt = 0;
+    liveTranslationRetryAt = 0;
+    liveSnapshot = "";
+    livePendingSince = 0;
+    liveConsumed = "";
+    captionRequestsRateLimited = false;
+    liveGeneration++;
     captionCues = [];
     translatedCues = [];
     lastSpokenIndex = -1;
@@ -675,7 +773,7 @@
       isInitialized = true;
       enableYouTubeCaptions();
       showOverlay("已切换实时字幕模式");
-      console.warn("[YouTube中文助手] 字幕文件下载失败，切换实时字幕模式");
+      console.info("[YouTube中文助手] 字幕文件不可直接读取，已切换实时字幕模式");
       return;
     }
 
@@ -702,22 +800,11 @@
       document.querySelectorAll(".caption-window .captions-text")
     );
     const nodes = segmentNodes.length > 0 ? segmentNodes : fallbackNodes;
-    const seen = new Set();
-
-    return nodes
-      .filter((node) => {
-        const style = window.getComputedStyle(node);
-        return style.display !== "none" && style.visibility !== "hidden";
-      })
-      .map((node) => normalizeCaptionText(node.textContent || ""))
-      .filter((text) => {
-        if (!text || seen.has(text)) return false;
-        seen.add(text);
-        return true;
-      })
-      .join(" ")
-      .replace(/\s+/g, " ")
-      .trim();
+    const visibleNodes = nodes.filter((node) => {
+      const style = window.getComputedStyle(node);
+      return style.display !== "none" && style.visibility !== "hidden";
+    });
+    return normalizeCaptionText(visibleNodes.map((node) => node.textContent || "").join(" "));
   }
 
   function normalizeCaptionText(text) {
@@ -728,37 +815,83 @@
   }
 
   async function pollLiveCaption() {
-    const text = getVisibleYouTubeCaptionText();
+    const snapshot = getVisibleYouTubeCaptionText();
+    const now = Date.now();
+    if (snapshot !== liveSnapshot) {
+      liveSnapshot = snapshot;
+      liveSnapshotAt = now;
+    }
+    const text = YTChineseHelperCore.newCaptionText(liveConsumed, snapshot);
     if (!text) {
+      livePendingSince = 0;
       if (!lastLiveCaptionText) showOverlay("请开启 YouTube 原字幕");
       return;
     }
+    if (!livePendingSince) livePendingSince = now;
+    if (!YTChineseHelperCore.shouldFlushLiveCaption(
+      now,
+      liveSnapshotAt,
+      livePendingSince,
+      LIVE_CAPTION_SETTLE_MS,
+      LIVE_CAPTION_MAX_WAIT_MS
+    )) return;
 
-    if (text === lastLiveCaptionText) {
+    if (text !== lastLiveCaptionText) {
+      lastLiveCaptionText = text;
+    }
+    if (text === lastLiveTranslatedSourceText) {
       if (lastLiveTranslatedText) showOverlay(lastLiveTranslatedText);
       return;
     }
 
-    lastLiveCaptionText = text;
-    if (liveTranslateInFlight) return;
+    if (
+      liveTranslateInFlight ||
+      now - lastLiveTranslationStartedAt < LIVE_TRANSLATION_INTERVAL_MS ||
+      now < liveTranslationRetryAt
+    ) {
+      return;
+    }
 
     liveTranslateInFlight = true;
+    const generation = liveGeneration;
+    lastLiveTranslationStartedAt = now;
     try {
       const result = await translate(text, activeSourceLanguage);
-      if (text === lastLiveCaptionText) {
+      if (generation !== liveGeneration) return;
+      if (result.status === "translated") {
+        liveConsumed = snapshot;
+        livePendingSince = 0;
+        liveTranslationRetryAt = 0;
+        lastLiveTranslatedSourceText = text;
         lastLiveTranslatedText = result.text;
         showOverlay(result.text);
-        if (
-          settings.ttsEnabled &&
-          result.status === "translated" &&
-          text !== lastLiveSpokenText
-        ) {
-          lastLiveSpokenText = text;
-          speak(result.text);
+      } else {
+        const code = result.error?.code || "UNKNOWN_ERROR";
+        const message = result.error?.message || "Unknown translation error";
+        const rateLimited = /HTTP 429/i.test(message);
+        if (rateLimited) {
+          liveTranslationRetryAt = Date.now() + LIVE_TRANSLATION_BACKOFF_MS;
+          showOverlay("翻译请求过快，稍后自动恢复");
+        } else {
+          lastLiveTranslatedSourceText = text;
+          lastLiveTranslatedText = "";
+          showOverlay("翻译暂时不可用");
         }
+        console.warn(
+          `[YouTube中文助手] 实时字幕翻译失败 [${code}] ${message} ` +
+            `(source=${activeSourceLanguage}, length=${text.length})`
+        );
+      }
+      if (
+        settings.ttsEnabled &&
+        result.status === "translated" &&
+        text !== lastLiveSpokenText
+      ) {
+        lastLiveSpokenText = text;
+        speak(result.text);
       }
     } finally {
-      liveTranslateInFlight = false;
+      if (generation === liveGeneration) liveTranslateInFlight = false;
     }
   }
 
@@ -782,6 +915,8 @@
 
   async function pollSubtitles() {
     if (!isInitialized || !settings.translateEnabled) return;
+    const video = document.querySelector("video");
+    if (!video || video.seeking || (video.paused && video !== heldVideo)) return;
 
     if (liveCaptionMode) {
       await pollLiveCaption();
@@ -822,7 +957,34 @@
     speakQueue = [];
     isSpeaking = false;
     speakToken++;
+    liveGeneration++;
+    liveTranslateInFlight = false;
+    releaseVideo();
   }
+
+  document.addEventListener("seeking", (event) => {
+    if (event.target.tagName !== "VIDEO") return;
+    heldVideo = null;
+    speechSynthesis.cancel();
+    speakQueue = [];
+    isSpeaking = false;
+    speakToken++;
+    liveGeneration++;
+    liveTranslateInFlight = false;
+    liveSnapshot = "";
+    livePendingSince = 0;
+    liveConsumed = "";
+    lastLiveTranslatedSourceText = "";
+    lastLiveSpokenText = "";
+    lastSpokenIndex = -1;
+  }, true);
+
+  document.addEventListener("pause", (event) => {
+    if (event.target.tagName === "VIDEO" && event.target !== heldVideo) speechSynthesis.pause();
+  }, true);
+  document.addEventListener("play", (event) => {
+    if (event.target.tagName === "VIDEO") speechSynthesis.resume();
+  }, true);
 
   // Handle YouTube SPA navigation
   function handleNavigation() {

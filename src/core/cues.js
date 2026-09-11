@@ -40,7 +40,23 @@
     };
   }
 
-  const api = { createCue, parseJson3Captions, buildTranslationRequestParams };
+  function newCaptionText(previous, current) {
+    if (!previous) return current;
+    if (previous === current || previous.endsWith(current)) return "";
+    for (let length = Math.min(previous.length, current.length); length > 0; length--) {
+      if (previous.slice(-length) === current.slice(0, length) &&
+          (length === previous.length || /\s/.test(previous[previous.length - length - 1]) || /[\u3000-\u9fff\uac00-\ud7af]/.test(current[0]))) {
+        return current.slice(length).trim();
+      }
+    }
+    return current;
+  }
+
+  function shouldFlushLiveCaption(now, lastChangedAt, pendingSince, settleMs = 900, maxWaitMs = 1800) {
+    return now - lastChangedAt >= settleMs || now - pendingSince >= maxWaitMs;
+  }
+
+  const api = { createCue, parseJson3Captions, buildTranslationRequestParams, newCaptionText, shouldFlushLiveCaption };
   global.YTChineseHelperCore = { ...(global.YTChineseHelperCore || {}), ...api };
   if (typeof module !== "undefined" && module.exports) module.exports = api;
 })(typeof globalThis !== "undefined" ? globalThis : this);
